@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>WebAR 粒子手势流体 | Three.js + MediaPipe Hands</title>
+  <style>
+    html,body{margin:0;height:100%;background:#000;overflow:hidden}
+    #wrap{position:fixed;inset:0}
+    #video{
+      position:absolute;inset:0;
+      width:100%;height:100%;object-fit:cover;
+      transform:scaleX(-1); /* 镜像更像“AR镜子” */
+      filter:saturate(1.05) contrast(1.02);
+    }
+    #gl{
+      position:absolute;inset:0;
+      width:100%;height:100%;
+      pointer-events:none;
+    }
+    #hud{
+      position:absolute;left:10px;top:10px;z-index:5;
+      font:12px/1.3 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      color:#aefcff;
+      background:rgba(0,0,0,.35);
+      border:1px solid rgba(174,252,255,.22);
+      padding:10px 12px;border-radius:10px;
+      backdrop-filter: blur(8px);
+      user-select:none;
+      max-width:min(520px, calc(100vw - 20px));
+    }
+    #hud b{color:#d7ffff}
+    #hint{opacity:.85;margin-top:6px}
+    #warn{
+      position:absolute;left:10px;bottom:10px;z-index:5;
+      color:#fff;font:12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, "PingFang SC","Microsoft YaHei", sans-serif;
+      opacity:.75
+    }
+    a{color:#aefcff}
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="gl"></canvas>
+  <div id="hud">
+    <div><b>WebAR 粒子互动</b>（16,000 青色流体粒子 / 速度+加速度物理）</div>
+    <div id="state">手势：<b>--</b>　爆炸过渡：<b>--</b>　风暴：<b>--</b>　深度缩放：<b>--</b></div>
+    <div id="hint">
+      五态：张手=球　✌=“我是 Mok”文字　握拳=圆环　☝=星　👍=爱心<br/>
+      快速挥手：风暴吹散粒子　手掌变大/变小：推拉缩放粒子系统
+    </div>
+  </div>
+  <div id="warn">若相机无权限：请用 HTTPS 或本地 localhost 打开。</div>
+</div>
+
+<!-- Three.js (unpkg) -->
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+
+<!-- MediaPipe Hands (unpkg) -->
+<script src="https://unpkg.com/@mediapipe/hands@0.4/hands.js"></script>
+<script src="https://unpkg.com/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+
+<script>
+(() => {
+  // =========================
+  // Utils
+  // =========================
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a,b,t) => a + (b-a)*t;
+  const smoothstep = (a,b,x) => {
+    const t = clamp((x-a)/(b-a), 0, 1);
+    return t*t*(3-2*t);
+  };
+  const rand = (a=0,b=1)=>a+Math.random()*(b-a);
+
+  // =========================
+  // DOM
+  // =========================
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('gl');
+  const hudState = document.getElementById('state');
+
+  // =========================
+  // Three.js Scene
+  // =========================
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha:true, antialias:true, powerPreference:"high-performance" });
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  renderer.setClearColor(0x000000, 0); // 透明覆盖视频
+  const scene = new THREE.Scene();
+
+  const camera = new THREE.PerspectiveCamera(55, 1, 0.01, 100);
+  camera.position.set(0, 0, 3.0);
+
+  // Light not needed for Points, but keep subtle fog for depth feel
+  scene.fog = new THREE.FogExp2(0x000000, 0.55);
+
+  // =========================
+  // Particle System (16,000)
+  // =========================
+  const N = 16000;
+
+  // Geometry buffers
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(N * 3);
+  const colors = new Float32Array(N * 3);
+
+  // Physics state
+  const vel = new Float32Array(N * 3);
+  const acc = new Float32Array(N * 3);
+
+  // Targets for each shape (precomputed each time a new shape is generated)
+  const target = new Float32Array(N * 3);
+
+  // Random seeds for subtle curl/noise
+  const seed = new Float32Array(N * 3);
+
+  // Init particle cloud
+  for (let i=0;i<N;i++){
+    const i3 = i*3;
+    // start as a soft sphere-ish volume
+    const u = Math.random();
+    const v0 = Math.random();
+    const theta = 2*Math.PI*u;
+    const phi = Math.acos(2*v0 - 1);
+    const r = Math.cbrt(Math.random()) * 0.75;
+    positions[i3+0] = r*Math.sin(phi)*Math.cos(theta);
+    positions[i3+1] = r*Math.sin(phi)*Math.sin(theta);
+    positions[i3+2] = r*Math.cos(phi);
+
+    vel[i3+0] = rand(-0.02,0.02);
+    vel[i3+1] = rand(-0.02,0.02);
+    vel[i3+2] = rand(-0.02,0.02);
+
+    seed[i3+0] = rand(0, 1000);
+    seed[i3+1] = rand(0, 1000);
+    seed[i3+2] = rand(0, 1000);
+
+    // cyan-ish
+    const c = new THREE.Color().setHSL(0.50, 1.0, 0.62); // 青色
+    colors[i3+0] = c.r;
+    colors[i3+1] = c.g;
+    colors[i3+2] = c.b;
+  }
+
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const material = new THREE.PointsMaterial({
+    size: 0.018,
+    sizeAttenuation: true,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.95,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+
+  const points = new THREE.Points(geometry, material);
+  scene.add(points);
+
+  // Subtle glow sprite (cheap trick: larger faint layer)
+  const glowMat = new THREE.PointsMaterial({
+    size: 0.038,
+    sizeAttenuation: true,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.18,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+  const glow = new THREE.Points(geometry, glowMat);
+  scene.add(glow);
+
+  // =========================
+  // Shape Generators (N targets)
+  // =========================
+  function fillSphereTargets(out, radius=0.85){
+    for (let i=0;i<N;i++){
+      const i3=i*3;
+      const u=Math.random(), v=Math.random();
+      const theta = 2*Math.PI*u;
+      const phi = Math.acos(2*v-1);
+      const r = radius * Math.cbrt(Math.random());
+      out[i3+0]=r*Math.sin(phi)*Math.cos(theta);
+      out[i3+1]=r*Math.sin(phi)*Math.sin(theta);
+      out[i3+2]=r*Math.cos(phi);
+    }
+  }
+
+  function fillRingTargets(out, R=0.85, tube=0.10){
+    for (let i=0;i<N;i++){
+      const i3=i*3;
+      const a = Math.random()*2*Math.PI;
+      const b = Math.random()*2*Math.PI;
+      const rr = tube * (0.3 + 0.7*Math.random());
+      const x = (R + rr*Math.cos(b)) * Math.cos(a);
+      const y = (R + rr*Math.cos(b)) * Math.sin(a);
+      const z = rr*Math.sin(b);
+      out[i3+0]=x;
+      out[i3+1]=y;
+      out[i3+2]=z;
+    }
+  }
+
+  function fillStarTargets(out){
+    // 5-point star in 2D, with slight thickness
+    // Use polar radius that jumps between inner/outer
+    const outer=0.95, inner=0.42;
+    for (let i=0;i<N;i++){
+      const i3=i*3;
+      const t = Math.random()*2*Math.PI;
+      const k = 5;
+      const wave = Math.cos(k*t);
+      // map wave (-1..1) to blend inner/outer with sharpness
+      const sharp = Math.pow((wave*0.5+0.5), 2.8);
+      const r = lerp(inner, outer, sharp);
+      const jitter = (Math.random()-0.5)*0.03;
+      out[i3+0] = (r+jitter)*Math.cos(t);
+      out[i3+1] = (r+jitter)*Math.sin(t);
+      out[i3+2] = (Math.random()-0.5)*0.18;
+    }
+  }
